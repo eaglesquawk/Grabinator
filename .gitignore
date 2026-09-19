@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+.DS_Store
+
+# Runtime artifacts this tool itself creates — never belongs in the repo
+.grabinator_index.json
+*.fixed.mp4
+*.fixed.mp3
