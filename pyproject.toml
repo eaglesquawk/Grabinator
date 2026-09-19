@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grabinator"
+version = "0.5.0"
+description = "Download from TikTok, YouTube, Dailymotion, SoundCloud, Instagram, X, and Threads with security hardening, quality-aware dedupe, and macOS playback fixes."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "EagleSquwak" }
+]
+keywords = [
+    "tiktok", "youtube", "dailymotion", "soundcloud", "instagram", "twitter",
+    "x", "threads", "downloader", "yt-dlp", "video", "mp3", "cli",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Internet",
+]
+dependencies = [
+    "yt-dlp>=2026.1.1",
+    "tqdm>=4.66",
+    "certifi>=2024.2.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/eaglesquawk/grabinator"
+Repository = "https://github.com/eaglesquawk/grabinator"
+Issues = "https://github.com/eaglesquawk/grabinator/issues"
+Changelog = "https://github.com/eaglesquawk/grabinator/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6.0",
+    "pre-commit>=3.7",
+]
+
+[project.scripts]
+grabinator = "grabinator.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I", "S"]
+ignore = [
+    "E501",  # long lines happen with yt-dlp format strings; not worth blocking on
+    "S603",  # subprocess calls here always use explicit argument lists, never shell=True
+    "S607",  # "ffmpeg"/"ffprobe" are intentionally resolved via PATH, not hardcoded absolute paths
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]  # assert is the whole point of pytest tests
