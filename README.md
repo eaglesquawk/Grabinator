@@ -34,6 +34,7 @@ playback fixes for native macOS players. Also converts local video files to MP3 
 | **Audio** | `--mp3` extracts clean, padding-free audio on any platform |
 | **Local conversion** | `--convert PATH` turns existing video files into MP3s — no downloading |
 | **Captions** | `--captions` downloads subtitles only (converted to `.srt`), for a video or a whole playlist |
+| **Photo posts** | `--photos` saves a TikTok/Instagram/X/Threads photo-carousel post as individual full-quality images instead of a rendered slideshow video |
 | **Channels** | Point a YouTube channel/handle URL at Grabinator and it downloads every upload, same as a playlist |
 | **Playlists** | Full YouTube/SoundCloud playlist support, with `--range` to grab a specific span |
 | **Quality selection** | Capped one tier above 1080p by default, or pick interactively with `-q` |
@@ -153,6 +154,25 @@ Whatever subtitle format the source actually provides gets converted to `.srt`, 
 the output is consistent regardless of platform. If a video simply has no captions
 available, Grabinator says so and moves on rather than failing the whole run.
 
+### Photo posts
+
+```bash
+# Save a TikTok/Instagram/X/Threads photo-carousel post as individual images,
+# instead of the default behavior of rendering it into a slideshow video with audio
+grabinator "URL" --photos
+```
+
+By default, a photo-carousel post (no native video track) is reconstructed into an
+MP4 slideshow set to its audio track. `--photos` skips that rendering step entirely
+and instead saves each photo exactly as downloaded — no re-encoding, so this is
+definitionally the best available quality — into a new folder named after the post
+(`@username_id/`), numbered in post order (`1.jpg`, `2.jpg`, ...). Re-running against
+an already-downloaded post is skipped rather than re-downloading into a duplicate
+folder. `--photos` only applies to TikTok/Instagram/X/Threads; on any other platform,
+or if the post turns out to be a regular video rather than a photo post, Grabinator
+notes that and downloads normally instead. It can't be combined with `--mp3`,
+`--captions`, `-q`/`--choose-quality`, or `-c`/`--check-size`.
+
 ### Quality selection
 
 ```bash
@@ -233,7 +253,8 @@ Whatever you choose, each platform still gets its own subfolder underneath it.
   destination path is resolved and verified to stay inside the configured output
   directory before anything is written — blocking path traversal from a malicious or
   unexpected title.
-- Per-run URL and playlist-size caps guard against accidental bulk-scraping.
+- Per-run limits guard against accidental bulk-scraping: at most 25 URLs in one
+  invocation, and at most 200 videos pulled from any single playlist or channel.
 - The connectivity check only probes the exact host a given URL points to — never a
   fixed external address unrelated to what you asked to download.
 - `--convert` never opens the network at all, and never modifies or deletes the

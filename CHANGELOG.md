@@ -4,11 +4,39 @@ Every notable change to Grabinator lives here, newest first. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), though the writing
 leans toward plain explanation over strict categorization when that reads better.
 
-## [Unreleased]
+## [0.6.0]
 
-Cookies, captions, and full channel downloads — three additions that came out of the
-same idea: some content just isn't reachable with a plain, logged-out request.
+Cookies, captions, full channel downloads, and per-photo saving for carousel posts —
+additions that came out of the same idea: some content just isn't reachable (or
+usable) with the default, one-size-fits-all handling.
 
+- **Fixed: some TikTok photo-post URLs (`.../photo/<id>`) failed with
+  "Unsupported URL".** Older installed yt-dlp versions only recognize TikTok's
+  `/video/<id>` path, so a `/photo/<id>` link fell through to the generic
+  extractor and errored out instead of downloading. Grabinator now retries
+  once with `/photo/` rewritten to `/video/` when that specific failure
+  happens — TikTok resolves a post by its numeric ID either way, so this
+  recovers the download without needing yt-dlp to be up to date. (Keeping
+  yt-dlp current — `pip install -U yt-dlp` — still avoids needing the
+  fallback in the first place.)
+- **`--photos`.** For a TikTok/Instagram/X/Threads photo-carousel post, saves each
+  photo individually at its original (best available) quality instead of rendering
+  the post into a slideshow video with audio. The photos land in a new folder named
+  after the post (`@username_id/`), numbered in post order. Re-running against an
+  already-downloaded post is skipped, same as the rest of Grabinator's dedupe
+  behavior, rather than creating a duplicate folder. Only applies to
+  TikTok/Instagram/X/Threads; on any other platform, or when the post turns out to
+  be a regular video, Grabinator notes that and downloads normally instead.
+- **Fixed: inaccurate size estimates.** `-c`/`--check-size` could silently
+  understate a download's size — if only one component (say, the audio track but
+  not the video) reported a size, the total shown was just that one number,
+  presented as if it were the whole thing. It now says "at least ~X" and explains
+  that part of the size is unreported whenever any component's size couldn't be
+  determined, instead of quietly passing off a partial total as complete.
+- **Fixed: 3 ruff lint failures caught by CI** — a bare `try`/`except`/`pass`
+  (replaced with `contextlib.suppress`), an unaudited `urlopen` call in the
+  connectivity check (now explicitly rejects non-`https` schemes before opening
+  it), and a re-raised exception missing `from None` for proper exception chaining.
 - **Cookie-based authentication.** Private accounts, age-restricted videos, and other
   login-gated content can now be reached by reusing a session you already have.
   `--cookies-from-browser chrome` (or firefox, edge, safari, brave) pulls cookies

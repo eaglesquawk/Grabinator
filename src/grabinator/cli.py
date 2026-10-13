@@ -14,6 +14,7 @@ notes.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import re
@@ -94,7 +95,7 @@ VIDEO_EXTENSIONS = {
     ".mp4", ".mov", ".mkv", ".avi", ".webm", ".flv", ".wmv", ".m4v", ".3gp",
     ".ts", ".mpg", ".mpeg",
 }
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 
 # --------------------------------------------------------------------------
@@ -107,20 +108,17 @@ __version__ = "0.5.0"
 # a no-op (and safe) on Linux/macOS.
 def _harden_console_for_windows() -> None:
     for stream in (sys.stdout, sys.stderr):
-        try:
+        with contextlib.suppress(AttributeError, ValueError):
             stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError):
-            pass
     if sys.platform == "win32":
-        try:
+        with contextlib.suppress(Exception):
+            # best-effort — if this fails, colors just won't render
             import ctypes
             kernel32 = ctypes.windll.kernel32
             handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
             mode = ctypes.c_uint32()
             if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
                 kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
-        except Exception:
-            pass  # best-effort — if this fails, colors just won't render
 
 
 def check_dependencies(need_ytdlp: bool = True) -> None:
@@ -206,6 +204,12 @@ def check_internet(url: str, silent: bool = False, proxy: str | None = None) -> 
         # hasn't independently confirmed is on the allowlist itself.
         raise ValueError(f"rejected (host not allowed): {host!r}")
     probe_url = f"https://{host}/"
+    if urllib.parse.urlparse(probe_url).scheme != "https":
+        # Always true given the f-string above, but making the scheme an
+        # explicit, checked precondition — rather than an implicit property
+        # of how probe_url happens to be built — means a future edit can't
+        # accidentally open a file:// or other unexpected scheme here.
+        raise ValueError(f"refusing to open a non-https URL: {probe_url!r}")
     ok = False
     try:
         req = urllib.request.Request(probe_url, method="HEAD", headers={"User-Agent": "Mozilla/5.0"})
@@ -826,6 +830,7 @@ def extract_clean_mp3(input_path: Path, out_path: Path, silent: bool) -> None:
 def download_tiktok(
     url: str, out_dir: Path, silent: bool, mp3_only: bool, platform: str = "tiktok",
     proxy: str | None = None, cookies_from_browser: str | None = None, cookies_file: Path | None = None,
+    photos_only: bool = False,
 ) -> None:
     hook = ProgressHook(silent=silent)
 
@@ -848,8 +853,22 @@ def download_tiktok(
             ydl_opts["proxy"] = proxy
         ydl_opts.update(build_cookie_opts(cookies_from_browser, cookies_file))
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+        except yt_dlp.utils.DownloadError:
+            # Some yt-dlp versions' TikTok extractor only recognizes
+            # /video/<id> links, not /photo/<id> ones — a plain TikTok photo
+            # post then falls through to the generic extractor and fails
+            # with "Unsupported URL". TikTok resolves a post by its numeric
+            # ID regardless of which path segment was used to reach it, so
+            # retrying once with /photo/ rewritten to /video/ recovers these
+            # without needing the caller to know about the yt-dlp version gap.
+            retry_url = re.sub(r"/photo/(\d+)", r"/video/\1", url)
+            if retry_url == url:
+                raise
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(retry_url, download=True)
 
         post_id = sanitize_component(str(info.get("id", "post")))
         username_from_url = extract_username_from_url(url)
@@ -873,10 +892,21 @@ def download_tiktok(
             return
 
         # If yt-dlp gave us something with no video track, it's likely a
-        # photo/slideshow post — try to reconstruct it from its images+audio.
+        # photo/slideshow post — try to reconstruct it from its images+audio,
+        # or (with --photos) save each image as-is instead.
         if not has_video_stream(media_file):
             images = sorted(tmp_path.glob(f"{info.get('id')}_image*"))
             audio_candidates = [f for f in tmp_path.glob(f"{info.get('id')}*") if f.suffix in (".mp3", ".m4a", ".aac", ".wav")]
+
+            if photos_only:
+                if not images:
+                    raise RuntimeError(
+                        "post has no video track and no separable images were found; "
+                        "your yt-dlp version may need updating for this post type"
+                    )
+                save_post_photos(images, out_dir / base_name, silent)
+                return
+
             if images and audio_candidates:
                 rendered = tmp_path / f"{info.get('id')}_slideshow.mp4"
                 render_slideshow(images, audio_candidates[0], rendered, silent)
@@ -891,11 +921,35 @@ def download_tiktok(
                     "your yt-dlp version may need updating for this post type"
                 )
 
+        if photos_only and not silent:
+            print(f"Note: --photos requested, but this post is a regular video, not a photo "
+                  f"post — downloading the video normally. ({url})")
+
         media_file = ensure_mac_compatible(media_file, silent)
         finalize_output(
             media_file, out_dir, base_name + ".mp4",
             platform, post_id, mp3_only=False, silent=silent,
         )
+
+
+# Save a photo-carousel post's images as-is (no rendering, no re-encoding —
+# each file is exactly what was downloaded, so this is definitionally the
+# best available quality) into a new folder named after the post. If that
+# folder already exists with content in it, this is a repeat run and it's
+# skipped rather than re-downloading/duplicating.
+def save_post_photos(images: list[Path], dest_folder: Path, silent: bool) -> None:
+    if dest_folder.exists() and any(dest_folder.iterdir()):
+        if not silent:
+            print(f"⏭️  Already downloaded, skipping: {dest_folder}")
+        return
+
+    dest_folder.mkdir(parents=True, exist_ok=True)
+    width = len(str(len(images)))
+    for i, image_path in enumerate(images, start=1):
+        out_path = dest_folder / f"{i:0{width}d}{image_path.suffix}"
+        shutil.move(str(image_path), str(out_path))
+    if not silent:
+        print(f"✅ Saved {len(images)} photo(s): {dest_folder}")
 
 
 # --------------------------------------------------------------------------
@@ -919,12 +973,11 @@ def parse_range(range_str: str) -> tuple[int, int]:
 
     if any(p == "" for p in parts):
         raise ValueError(f"{range_str!r} — expected a number like 10, or a range like 3-7 or 3,7")
-    parts = [p.strip() for p in parts if p.strip() != ""]
 
     try:
         nums = [int(p) for p in parts]
     except ValueError:
-        raise ValueError(f"{range_str!r} — expected a number like 10, or a range like 3-7 or 3,7")
+        raise ValueError(f"{range_str!r} — expected a number like 10, or a range like 3-7 or 3,7") from None
 
     if len(nums) == 1:
         n = nums[0]
@@ -1205,7 +1258,13 @@ def human_size(num_bytes: float) -> str:
 def estimate_download_size(
     url: str, format_str: str, proxy: str | None = None,
     cookies_from_browser: str | None = None, cookies_file: Path | None = None,
-) -> int | None:
+) -> tuple[int, bool] | None:
+    """Returns (total_bytes, all_components_known), or None if nothing
+    could be determined at all. all_components_known is False when a
+    multi-part download (e.g. separate video + audio streams) has at
+    least one component whose size is unreported — in that case
+    total_bytes is a floor, not the real total, and callers must say so
+    rather than presenting it as a complete figure."""
     opts = {
         "quiet": True, "no_warnings": True, "noplaylist": True,
         "format": format_str, "simulate": True,
@@ -1221,13 +1280,15 @@ def estimate_download_size(
 
     candidates = info.get("requested_formats") or [info]
     total = 0
-    found = False
+    known_count = 0
     for f in candidates:
         size = f.get("filesize") or f.get("filesize_approx")
         if size:
             total += size
-            found = True
-    return total if found else None
+            known_count += 1
+    if known_count == 0:
+        return None
+    return total, known_count == len(candidates)
 
 
 # Show the estimated download size (without downloading) and ask the user
@@ -1236,11 +1297,16 @@ def prompt_size_and_confirm(
     url: str, format_str: str, proxy: str | None = None,
     cookies_from_browser: str | None = None, cookies_file: Path | None = None,
 ) -> bool:
-    size = estimate_download_size(url, format_str, proxy, cookies_from_browser, cookies_file)
-    if size is None:
+    result = estimate_download_size(url, format_str, proxy, cookies_from_browser, cookies_file)
+    if result is None:
         print(f"Could not determine file size for: {url}")
     else:
-        print(f"Estimated size: {human_size(size)}  ({url})")
+        total, all_known = result
+        if all_known:
+            print(f"Estimated size: ~{human_size(total)}  ({url})")
+        else:
+            print(f"Estimated size: at least ~{human_size(total)} — size of one or more "
+                  f"components is unreported, actual total will be larger  ({url})")
     while True:
         choice = input("Download this file? [y/N]: ").strip().lower()
         if choice in ("y", "yes"):
@@ -1334,6 +1400,7 @@ def download_one(
     playlist_range: tuple[int, int] | None = None,
     cookies_from_browser: str | None = None, cookies_file: Path | None = None,
     captions_only: bool = False, caption_lang: str = "en",
+    photos_only: bool = False,
 ) -> None:
     url = validate_source_url(url)
     platform = get_platform(url)
@@ -1347,6 +1414,10 @@ def download_one(
 
     if playlist_range and not is_pl and not silent:
         print(f"Note: --range only applies to playlist URLs — downloading this one normally. ({url})")
+
+    if photos_only and platform not in ("tiktok", "instagram", "x", "threads") and not silent:
+        print(f"Note: --photos only applies to TikTok/Instagram/X/Threads posts — downloading this normally. ({url})")
+        photos_only = False
 
     if captions_only:
         download_captions(url, out_dir, silent, platform, proxy, cookies_from_browser, cookies_file, caption_lang, playlist_range)
@@ -1382,13 +1453,14 @@ def download_one(
     if platform in ("youtube", "dailymotion", "soundcloud"):
         download_generic(url, platform_dir, silent, mp3_only, platform, target_height, proxy, playlist_range, cookies_from_browser, cookies_file)
     else:
-        download_tiktok(url, platform_dir, silent, mp3_only, platform, proxy, cookies_from_browser, cookies_file)
+        download_tiktok(url, platform_dir, silent, mp3_only, platform, proxy, cookies_from_browser, cookies_file, photos_only)
 
 
 def main() -> None:
     _harden_console_for_windows()
     parser = argparse.ArgumentParser(
         description="Download TikTok, YouTube, Dailymotion, SoundCloud, Instagram, X, and Threads videos/tracks/playlists.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("urls", nargs="?", default=None, help="One URL, or several separated by commas")
     parser.add_argument("-s", "--silent", action="store_true", help="Suppress progress bar and status output")
@@ -1440,11 +1512,20 @@ def main() -> None:
         help="Language code to request with --captions (default: en).",
     )
     parser.add_argument(
+        "--photos", action="store_true",
+        help="For a photo/carousel post (TikTok, Instagram, X, Threads), save each photo "
+             "individually as-is instead of rendering the post into a video with its audio. "
+             "The photos go into a new folder named after the post (@username_id).",
+    )
+    parser.add_argument(
         "--log", action="store_true",
         help="Also write this run's full output to a timestamped .txt file under <output-dir>/logs/, "
              "in addition to the normal console output.",
     )
-    parser.add_argument("-V", "--version", action="version", version=f"grabinator {__version__}")
+    parser.add_argument(
+        "-V", "--version", action="version",
+        version=f"grabinator {__version__}\n\n<If you find this useful, consider starring the repository or supporting its development, thanks.>",
+    )
     args = parser.parse_args()
 
     if args.convert:
@@ -1465,6 +1546,10 @@ def main() -> None:
 
     if args.captions and (args.mp3 or args.choose_quality or args.check_size):
         print("--captions can't be combined with --mp3, --choose-quality, or --check-size — captions have no video/audio quality or size to select.")
+        sys.exit(1)
+
+    if args.photos and (args.mp3 or args.captions or args.choose_quality or args.check_size):
+        print("--photos can't be combined with --mp3, --captions, --choose-quality, or --check-size.")
         sys.exit(1)
 
     playlist_range = None
@@ -1503,6 +1588,7 @@ def main() -> None:
                 args.choose_quality, args.check_size, args.proxy, playlist_range,
                 args.cookies_from_browser, args.cookies,
                 args.captions, args.caption_lang,
+                args.photos,
             )
         except Exception as e:  # noqa: BLE001 — surface every failure, keep going
             failures += 1

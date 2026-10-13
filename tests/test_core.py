@@ -21,6 +21,7 @@ from grabinator.cli import (
     resolve_safe_destination,
     sanitize_component,
     sanitize_title,
+    save_post_photos,
     setup_run_logging,
     unique_path,
     validate_source_url,
@@ -399,4 +400,55 @@ def test_setup_run_logging_does_not_duplicate_console_output(tmp_path):
     # The tee should write to the real (fake, in this test) stream exactly
     # once — the console copy isn't duplicated by the logging side.
     assert fake_stdout.getvalue().count("only once") == 1
+
+
+# --------------------------------------------------------------------------
+# --photos: save a photo-carousel post's images as-is
+# --------------------------------------------------------------------------
+def test_save_post_photos_moves_images_with_sequential_names(tmp_path):
+    images = []
+    for i in range(3):
+        p = tmp_path / f"post_image{i}.jpg"
+        p.write_bytes(f"img{i}".encode())
+        images.append(p)
+
+    dest = tmp_path / "dest" / "@user_123"
+    save_post_photos(images, dest, silent=True)
+
+    result = sorted(dest.iterdir())
+    assert [f.name for f in result] == ["1.jpg", "2.jpg", "3.jpg"]
+    assert result[0].read_bytes() == b"img0"
+    # Originals were moved, not copied.
+    assert not images[0].exists()
+
+
+def test_save_post_photos_zero_pads_names_for_ten_or_more_images(tmp_path):
+    images = []
+    for i in range(12):
+        p = tmp_path / f"post_image{i}.png"
+        p.write_bytes(b"x")
+        images.append(p)
+
+    dest = tmp_path / "dest"
+    save_post_photos(images, dest, silent=True)
+
+    names = sorted(f.name for f in dest.iterdir())
+    assert names[0] == "01.png"
+    assert names[-1] == "12.png"
+
+
+def test_save_post_photos_skips_if_destination_already_populated(tmp_path):
+    dest = tmp_path / "@user_999"
+    dest.mkdir()
+    (dest / "existing.jpg").write_bytes(b"already there")
+
+    image = tmp_path / "newimg_image0.jpg"
+    image.write_bytes(b"should not move")
+
+    save_post_photos([image], dest, silent=True)
+
+    # Nothing changed: the pre-existing file is untouched and the new image
+    # was never moved in.
+    assert [f.name for f in dest.iterdir()] == ["existing.jpg"]
+    assert image.exists()
 
