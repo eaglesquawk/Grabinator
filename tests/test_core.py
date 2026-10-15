@@ -7,11 +7,14 @@ on every push/PR.
 import pytest
 
 from grabinator.cli import (
+    QuietYtDlpLogger,
     build_cookie_opts,
     check_internet,
+    collect_photo_files,
     gather_video_paths,
     get_platform,
     get_playlist_index_offset,
+    handle_carousel_entries,
     human_size,
     is_channel_url,
     is_playlist_url,
@@ -452,3 +455,113 @@ def test_save_post_photos_skips_if_destination_already_populated(tmp_path):
     assert [f.name for f in dest.iterdir()] == ["existing.jpg"]
     assert image.exists()
 
+
+
+# --------------------------------------------------------------------------
+# Multi-item (carousel) posts: image-only items need no ffmpeg
+# --------------------------------------------------------------------------
+def test_carousel_photos_only_saves_every_photo_in_post_order(tmp_path):
+    work, out = tmp_path / "work", tmp_path / "out"
+    work.mkdir()
+    out.mkdir()
+    ids = [f"p{i}" for i in range(10)]
+    for i in ids:
+        (work / f"{i}.jpg").write_bytes(b"img")
+
+    handle_carousel_entries(
+        [{"id": i} for i in ids], work, out, "@user_POST", "instagram", "POST",
+        mp3_only=False, photos_only=True, silent=True, url="u",
+    )
+
+    names = sorted(f.name for f in (out / "@user_POST").iterdir())
+    assert names == [f"{n:02d}.jpg" for n in range(1, 11)]
+
+
+def test_carousel_with_no_files_and_no_photos_flag_points_to_photos_flag(tmp_path):
+    with pytest.raises(RuntimeError, match="--photos"):
+        handle_carousel_entries(
+            [{"id": "a"}, {"id": "b"}], tmp_path, tmp_path / "out", "@u_P", "instagram", "P",
+            mp3_only=False, photos_only=False, silent=True, url="u",
+        )
+
+
+def test_carousel_photos_only_with_nothing_retrievable_suggests_updating(tmp_path):
+    with pytest.raises(RuntimeError, match="yt-dlp"):
+        handle_carousel_entries(
+            [{"id": "a"}], tmp_path, tmp_path / "out", "@u_P", "instagram", "P",
+            mp3_only=False, photos_only=True, silent=True, url="u",
+        )
+
+
+def test_carousel_all_items_failed_raises(tmp_path):
+    with pytest.raises(RuntimeError):
+        handle_carousel_entries(
+            [None, None], tmp_path, tmp_path / "out", "@u_P", "instagram", "P",
+            mp3_only=False, photos_only=False, silent=True, url="u",
+        )
+
+
+def test_carousel_photos_are_found_even_when_yt_dlp_returns_no_entries(tmp_path):
+    # What yt-dlp actually does for an all-photo Instagram post: it writes
+    # each photo's thumbnail, then errors on the item, so every entry comes
+    # back as None and the images on disk are the only trace.
+    work, out = tmp_path / "work", tmp_path / "out"
+    work.mkdir()
+    out.mkdir()
+    for i in range(10):
+        (work / f"DO6gs_{i:02d}.jpg").write_bytes(b"img")
+
+    handle_carousel_entries(
+        [None] * 10, work, out, "@user_POST", "instagram", "POST",
+        mp3_only=False, photos_only=True, silent=True, url="u",
+    )
+
+    names = sorted(f.name for f in (out / "@user_POST").iterdir())
+    assert names == [f"{n:02d}.jpg" for n in range(1, 11)]
+
+
+def test_collect_photo_files_excludes_a_videos_own_thumbnail(tmp_path):
+    (tmp_path / "VID1.mp4").write_bytes(b"video")
+    (tmp_path / "VID1.jpg").write_bytes(b"thumb of the video")
+    (tmp_path / "PH1.jpg").write_bytes(b"photo")
+
+    assert [f.name for f in collect_photo_files(tmp_path)] == ["PH1.jpg"]
+
+
+# --------------------------------------------------------------------------
+# Quiet yt-dlp logger for Instagram --photos runs
+# --------------------------------------------------------------------------
+def test_quiet_logger_hides_known_photo_noise_and_keeps_real_problems():
+    log = QuietYtDlpLogger()
+    log.info("[download] Downloading item 1 of 10")
+    log.warning("WARNING: No video formats found!")
+    log.warning("WARNING: Requested format is not available")
+    log.error("ERROR: [Instagram] abc: No video formats found!; please report this issue")
+    log.error("ERROR: [Instagram] abc: Login required to view this post")
+    log.error("ERROR: [Instagram] abc: Login required to view this post")
+
+    # Noise dropped, prefix stripped, repeated message listed once.
+    assert log.details() == "[Instagram] abc: Login required to view this post"
+
+
+def test_quiet_logger_with_only_noise_has_no_details():
+    log = QuietYtDlpLogger()
+    log.error("ERROR: [Instagram] abc: No video formats found!")
+    assert log.details() == ""
+
+
+def test_collect_photo_files_keeps_only_the_largest_candidate_per_photo(tmp_path):
+    import os
+
+    # Fake bytes ffprobe can't read, so the size on disk decides (the real
+    # pixel measurement is exercised against real images by hand).
+    candidates = {
+        "A.0.jpg": 10, "A.1.jpg": 900, "A.2.jpg": 300,   # A's largest is not the last index
+        "B.0.jpg": 50, "B.1.jpg": 20,
+    }
+    for i, (name, size) in enumerate(candidates.items()):
+        f = tmp_path / name
+        f.write_bytes(b"x" * size)
+        os.utime(f, ns=(1_000_000 * (i + 1), 1_000_000 * (i + 1)))  # A written before B
+
+    assert [f.name for f in collect_photo_files(tmp_path)] == ["A.1.jpg", "B.0.jpg"]

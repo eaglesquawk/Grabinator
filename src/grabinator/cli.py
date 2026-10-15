@@ -95,7 +95,8 @@ VIDEO_EXTENSIONS = {
     ".mp4", ".mov", ".mkv", ".avi", ".webm", ".flv", ".wmv", ".m4v", ".3gp",
     ".ts", ".mpg", ".mpeg",
 }
-__version__ = "0.6.0"
+__version__ = "0.6.1"
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".avif"}
 
 
 # --------------------------------------------------------------------------
@@ -213,16 +214,16 @@ def check_internet(url: str, silent: bool = False, proxy: str | None = None) -> 
     ok = False
     try:
         req = urllib.request.Request(probe_url, method="HEAD", headers={"User-Agent": "Mozilla/5.0"})
+        # One opener for both cases (rather than urlopen for the no-proxy
+        # path): the scheme was verified as https above, and build_opener
+        # without an explicit ProxyHandler still honours the environment's
+        # proxy settings exactly as urlopen does.
+        handlers: list[urllib.request.BaseHandler] = [urllib.request.HTTPSHandler(context=_SSL_CONTEXT)]
         if proxy:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                urllib.request.HTTPSHandler(context=_SSL_CONTEXT),
-            )
-            with opener.open(req, timeout=NETWORK_TIMEOUT):
-                ok = True
-        else:
-            with urllib.request.urlopen(req, timeout=NETWORK_TIMEOUT, context=_SSL_CONTEXT):
-                ok = True
+            handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        opener = urllib.request.build_opener(*handlers)
+        with opener.open(req, timeout=NETWORK_TIMEOUT):
+            ok = True
     except Exception:
         ok = False
 
@@ -459,6 +460,23 @@ def get_video_height(path: Path) -> int:
         return int(result.stdout.strip())
     except ValueError:
         return 0
+
+
+# Pixel dimensions of an image file, or None if ffprobe can't read it.
+def get_image_size(path: Path) -> tuple[int, int] | None:
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=p=0",
+        str(path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        w, h = result.stdout.strip().split(",")[:2]
+        return int(w), int(h)
+    except (ValueError, OSError):
+        return None
 
 
 # Actual (file size / duration) bitrate — more reliable than reported
@@ -810,6 +828,15 @@ def ensure_mac_compatible(path: Path, silent: bool) -> Path:
 # platform's --mp3 output, so the fix applies uniformly everywhere,
 # YouTube included.
 def extract_clean_mp3(input_path: Path, out_path: Path, silent: bool) -> None:
+    # If the source is already an .mp3 (some platforms serve audio-only posts
+    # that way), input_path and out_path can resolve to the exact same file.
+    # Handing ffmpeg the same path for -i and the output truncates the file
+    # while it's still being read, corrupting the input and failing outright
+    # — so re-encode into a sibling temp file first, then swap it into place.
+    real_out_path = out_path
+    if input_path.resolve() == out_path.resolve():
+        out_path = out_path.with_name(out_path.stem + ".grabinator_tmp" + out_path.suffix)
+
     cmd = [
         "ffmpeg", "-y",
         "-fflags", "+genpts",
@@ -821,16 +848,74 @@ def extract_clean_mp3(input_path: Path, out_path: Path, silent: bool) -> None:
     ]
     run_ffmpeg_with_progress(cmd, get_media_duration(input_path), "Extracting MP3", silent)
 
+    if out_path != real_out_path:
+        out_path.replace(real_out_path)
+
 
 # --------------------------------------------------------------------------
 # TikTok + Instagram download logic — both are short-form, username-driven
 # platforms with the same @handle_id naming convention and the same
 # possibility of a photo/slideshow post with no native video track.
 # --------------------------------------------------------------------------
+# yt-dlp reports an error for every Instagram photo item even after it has
+# written the photo, which would bury a successful --photos run in red text.
+# This logger swallows its messages and keeps the warnings/errors, so they can
+# be attached to the failure if (and only if) the run genuinely fails.
+class QuietYtDlpLogger:
+    # Known noise from photo items that did get saved.
+    _NOISE = ("No video formats found", "Requested format is not available")
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def debug(self, msg: str) -> None:
+        pass
+
+    def info(self, msg: str) -> None:
+        pass
+
+    def warning(self, msg: str) -> None:
+        self.messages.append(msg)
+
+    def error(self, msg: str) -> None:
+        self.messages.append(msg)
+
+    def details(self) -> str:
+        seen: list[str] = []
+        for m in self.messages:
+            m = re.sub(r"^(WARNING|ERROR):\s*", "", m).strip()
+            if m and not any(n in m for n in self._NOISE) and m not in seen:
+                seen.append(m)
+        return "; ".join(seen)
+
+
+# For Instagram --photos runs, yt-dlp's own console output is suppressed and
+# replaced by Grabinator's single result line; if the run fails, whatever
+# yt-dlp actually complained about (beyond the known photo-item noise) is
+# appended to the error so a real problem (private post, login needed) isn't
+# hidden.
 def download_tiktok(
     url: str, out_dir: Path, silent: bool, mp3_only: bool, platform: str = "tiktok",
     proxy: str | None = None, cookies_from_browser: str | None = None, cookies_file: Path | None = None,
     photos_only: bool = False,
+) -> None:
+    quiet_log = QuietYtDlpLogger() if platform == "instagram" and photos_only else None
+    try:
+        _download_tiktok(
+            url, out_dir, silent, mp3_only, platform, proxy,
+            cookies_from_browser, cookies_file, photos_only, quiet_log,
+        )
+    except Exception as e:
+        details = quiet_log.details() if quiet_log else ""
+        if details:
+            raise RuntimeError(f"{e} (yt-dlp said: {details})") from e
+        raise
+
+
+def _download_tiktok(
+    url: str, out_dir: Path, silent: bool, mp3_only: bool, platform: str,
+    proxy: str | None, cookies_from_browser: str | None, cookies_file: Path | None,
+    photos_only: bool, quiet_log: QuietYtDlpLogger | None,
 ) -> None:
     hook = ProgressHook(silent=silent)
 
@@ -848,10 +933,32 @@ def download_tiktok(
             "retries": 3,
             "socket_timeout": 15,
             "noplaylist": True,
+            # A mixed Instagram carousel (some video items, some plain-photo
+            # items) is exposed by yt-dlp as a multi-item result regardless
+            # of noplaylist, and a photo-only item has no video/audio format
+            # to satisfy our selector at all ("No video formats found!").
+            # Without this, that one item aborts the whole post — with it,
+            # yt-dlp leaves a None placeholder for the failed item and keeps
+            # going, so the rest of the carousel still comes through.
+            "ignoreerrors": True,
         }
         if proxy:
             ydl_opts["proxy"] = proxy
         ydl_opts.update(build_cookie_opts(cookies_from_browser, cookies_file))
+        if platform == "instagram":
+            # yt-dlp treats every photo in an Instagram post as its own entry
+            # with no video/audio formats, and (by design) has no format to
+            # download for it. Keeping those entries alive instead of erroring
+            # lets us see them, and for --photos the thumbnail yt-dlp writes
+            # for such an entry is the photo itself — the route yt-dlp's
+            # maintainers point to for saving Instagram photos.
+            ydl_opts["ignore_no_formats_error"] = True
+            if photos_only:
+                # Every size Instagram lists for each photo; the largest is
+                # chosen afterwards by measuring (see collect_photo_files).
+                ydl_opts["write_all_thumbnails"] = True
+        if quiet_log is not None:
+            ydl_opts["logger"] = quiet_log
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -870,16 +977,61 @@ def download_tiktok(
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(retry_url, download=True)
 
+        if info is None:
+            # With ignoreerrors, a single Instagram photo post comes back as
+            # None even though yt-dlp already wrote its image (see
+            # collect_photo_files) — recover it from disk under --photos.
+            photo_files = collect_photo_files(tmp_path) if platform == "instagram" and photos_only else []
+            if photo_files:
+                m = re.search(r"instagram\.com/(?:([\w.]+)/)?(?:p|reels?|tv)/([\w\-]+)", url)
+                name = "@{}_{}".format(
+                    sanitize_component(extract_username_from_url(url) or (m.group(1) if m else None) or "unknown"),
+                    sanitize_component(m.group(2) if m else "post"),
+                )
+                save_post_photos(photo_files, out_dir / name, silent)
+                return
+            if platform == "instagram":
+                raise RuntimeError(
+                    "no downloadable video in this post; if it is a photo post, "
+                    "re-run with --photos to save its photo"
+                )
+            raise RuntimeError("yt-dlp could not extract anything downloadable from this post")
+
         post_id = sanitize_component(str(info.get("id", "post")))
         username_from_url = extract_username_from_url(url)
         username = sanitize_component(
             username_from_url or info.get("uploader") or info.get("uploader_id") or info.get("creator") or "unknown"
         )
+        base_name = f"@{username}_{post_id}"
+
+        # A multi-item post (an Instagram carousel is the common case) is
+        # exposed as a list of per-item entries rather than one downloaded
+        # file — handle that shape separately from a regular single post.
+        entries = info.get("entries")
+        if entries is not None:
+            handle_carousel_entries(
+                list(entries), tmp_path, out_dir, base_name, platform, post_id,
+                mp3_only, photos_only, silent, url,
+            )
+            return
 
         downloaded_files = list(tmp_path.glob(f"{info.get('id')}.*"))
+        # A thumbnail written next to the media (--photos on Instagram) must
+        # never be mistaken for the media itself.
+        media_candidates = [f for f in downloaded_files if f.suffix.lower() not in IMAGE_EXTENSIONS]
+        if platform == "instagram" and downloaded_files and not media_candidates:
+            # Only an image came down: a single-photo post.
+            if photos_only:
+                save_post_photos(sorted(downloaded_files), out_dir / base_name, silent)
+                return
+        if platform == "instagram" and not media_candidates:
+            raise RuntimeError(
+                "no downloadable video found in this post; if it is a photo post, "
+                "re-run with --photos to save its photos"
+            )
         if not downloaded_files:
             raise RuntimeError("yt-dlp reported success but no output file was found")
-        media_file = downloaded_files[0]
+        media_file = (media_candidates or downloaded_files)[0]
 
         base_name = f"@{username}_{post_id}"
 
@@ -932,6 +1084,112 @@ def download_tiktok(
         )
 
 
+# Images yt-dlp wrote into the working folder for items that have no real
+# media file of their own — i.e. photo items. For an Instagram photo, yt-dlp
+# writes the photo as a "thumbnail" (and, with write_all_thumbnails, one file
+# per size Instagram lists: <id>.<n>.jpg) and then reports "No video formats
+# found!" for that item, so with ignoreerrors on the item comes back as None
+# and its only trace is the images on disk. A video item's own thumbnail is
+# excluded (its id has a real media file). One photo per item is returned: the
+# one with the most pixels, measured rather than assumed from yt-dlp's
+# ordering (file size breaks ties and covers images ffprobe can't read).
+# Items are ordered by when yt-dlp wrote them, which is the post's item order.
+def collect_photo_files(tmp_path: Path) -> list[Path]:
+    def item_id(f: Path) -> str:
+        return f.name.split(".")[0]
+
+    files = [f for f in tmp_path.iterdir() if f.is_file()]
+    ids_with_media = {item_id(f) for f in files if f.suffix.lower() not in IMAGE_EXTENSIONS}
+    by_item: dict[str, list[Path]] = {}
+    for f in files:
+        if f.suffix.lower() in IMAGE_EXTENSIONS and item_id(f) not in ids_with_media:
+            by_item.setdefault(item_id(f), []).append(f)
+
+    def quality(f: Path) -> tuple[int, int]:
+        size = get_image_size(f)
+        return (size[0] * size[1] if size else 0, f.stat().st_size)
+
+    best = {i: max(candidates, key=quality) for i, candidates in by_item.items()}
+    first_written = {i: min(f.stat().st_mtime_ns for f in c) for i, c in by_item.items()}
+    return [best[i] for i in sorted(best, key=lambda i: (first_written[i], i))]
+
+
+# Handle a multi-item post (an Instagram carousel is the common case). yt-dlp
+# exposes it as a list of per-item entries, each with its own id and its own
+# downloaded file, unlike a single post which is one file start to finish.
+#   - video items are saved one by one as @username_postid_N.mp4
+#   - photo items are skipped with a note, or with --photos saved as-is into
+#     a @username_postid/ folder (found via collect_photo_files)
+def handle_carousel_entries(
+    entries: list, tmp_path: Path, out_dir: Path, base_name: str,
+    platform: str, post_id: str, mp3_only: bool, photos_only: bool,
+    silent: bool, url: str,
+) -> None:
+    handled = 0  # items that reached the save step (a dedupe-skip still counts)
+    skipped_photos = 0
+    # Snapshot the photos before touching anything: saving a video moves its
+    # file out of the working folder, which would leave that video's own
+    # thumbnail looking like an orphaned photo.
+    photo_files = collect_photo_files(tmp_path)
+
+    for idx, entry in enumerate((e for e in entries if e), start=1):
+        entry_id = sanitize_component(str(entry.get("id", f"item{idx}")))
+        # Prefer the real media file; a thumbnail written beside a video item
+        # must not be mistaken for it. Items with only an image are photos
+        # and are gathered below.
+        media_files = sorted(
+            f for f in tmp_path.glob(f"{entry_id}.*") if f.suffix.lower() not in IMAGE_EXTENSIONS
+        )
+        if not media_files:
+            continue
+        media_file = media_files[0]
+        content_id = f"{post_id}:{entry_id}"
+
+        if mp3_only:
+            mp3_file = media_file.with_suffix(".mp3")
+            extract_clean_mp3(media_file, mp3_file, silent)
+            finalize_output(
+                mp3_file, out_dir, f"{base_name}_{idx}.mp3",
+                platform, content_id, mp3_only=True, silent=silent,
+            )
+            handled += 1
+            continue
+
+        if not has_video_stream(media_file):
+            skipped_photos += 1
+            continue
+
+        media_file = ensure_mac_compatible(media_file, silent)
+        finalize_output(
+            media_file, out_dir, f"{base_name}_{idx}.mp4",
+            platform, content_id, mp3_only=False, silent=silent,
+        )
+        handled += 1
+
+    if photo_files and photos_only:
+        save_post_photos(photo_files, out_dir / base_name, silent)
+    elif photo_files:
+        skipped_photos += len(photo_files)
+    elif photos_only and handled and not silent:
+        print(f"Note: --photos requested, but this post has no photo items; "
+              f"downloaded its video item(s) normally. ({url})")
+
+    if skipped_photos and not photos_only and not silent:
+        print(f"Note: {skipped_photos} item(s) in this post have no downloadable video "
+              f"(photos); use --photos to save them. ({url})")
+
+    if handled == 0 and not photo_files:
+        if photos_only:
+            raise RuntimeError(
+                "none of this post's photos could be retrieved; "
+                "try updating yt-dlp (pip install -U yt-dlp)"
+            )
+        raise RuntimeError(
+            "no downloadable video in this post; if it is made of photos, "
+            "re-run with --photos to save them"
+        )
+
+
 # Save a photo-carousel post's images as-is (no rendering, no re-encoding —
 # each file is exactly what was downloaded, so this is definitionally the
 # best available quality) into a new folder named after the post. If that
@@ -949,7 +1207,9 @@ def save_post_photos(images: list[Path], dest_folder: Path, silent: bool) -> Non
         out_path = dest_folder / f"{i:0{width}d}{image_path.suffix}"
         shutil.move(str(image_path), str(out_path))
     if not silent:
-        print(f"✅ Saved {len(images)} photo(s): {dest_folder}")
+        sizes = {get_image_size(dest_folder / f"{i:0{width}d}{p.suffix}") for i, p in enumerate(images, start=1)}
+        shown = ", ".join(f"{w}x{h}" for w, h in sorted(z for z in sizes if z))
+        print(f"✅ Saved {len(images)} photo(s){f' ({shown})' if shown else ''}: {dest_folder}")
 
 
 # --------------------------------------------------------------------------

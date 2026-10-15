@@ -4,6 +4,64 @@ Every notable change to Grabinator lives here, newest first. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), though the writing
 leans toward plain explanation over strict categorization when that reads better.
 
+## [Unreleased]
+
+## [0.6.1]
+
+Fixes for Instagram photo posts and carousels, TikTok `--mp3`, and CI.
+
+- **Quiet output for Instagram `--photos`.** yt-dlp reports an error for every
+  Instagram photo item even after it has saved the photo, so a fully successful
+  run used to end in a wall of red text. During `--photos` runs on Instagram,
+  yt-dlp's console output is now suppressed and only Grabinator's own result
+  line (for example, "Saved 10 photo(s)") is shown. If the run genuinely fails,
+  whatever yt-dlp actually complained about (a private post, a login
+  requirement) is appended to the error instead of being hidden.
+- **Instagram `--photos` now picks the highest-resolution copy explicitly.**
+  Rather than trusting yt-dlp's default choice (which silently falls back to a
+  smaller size if the top one fails to download), Grabinator requests every size
+  Instagram lists for each photo, measures them, and keeps the one with the most
+  pixels. The success line reports the resolution, for example
+  `Saved 10 photo(s) (1080x1350)`. Photos are saved exactly as Instagram serves
+  them, so the result is as large as the largest size Instagram lists for the
+  post (logging in with `--cookies-from-browser` can expose more than a
+  logged-out request).
+- **Fixed: Instagram photo posts failed with "No video formats found!" on
+  every item.** yt-dlp treats each photo in an Instagram post as its own entry
+  with no video or audio formats, and has no download for it (this is
+  intentional on its side), so a post made only of photos could never succeed.
+  With `--photos`, Grabinator now keeps those entries and saves the thumbnail
+  yt-dlp writes for each one, which is the route yt-dlp's maintainers suggest
+  for Instagram photos. They land in order in the `@username_postid/` folder.
+  Without `--photos`, the error now says the post is photos-only and suggests
+  the flag instead of a generic failure. A video's thumbnail is also no longer
+  mistaken for the video in mixed posts. Instagram only; TikTok/X/Threads
+  handling is unchanged. yt-dlp reports every photo item as an error even after
+  writing its image, so the photos are collected from what it wrote to disk
+  rather than from its (empty) list of results.
+- **Fixed: CI lint job kept failing on S310.** The earlier fix added an explicit
+  `https` check before the connectivity probe, but ruff's S310 rule can't see
+  that and still flagged the `urlopen` call. `check_internet` now builds an
+  opener for both the proxy and no-proxy cases and calls `opener.open`, which
+  keeps the same behaviour (including honouring the environment's proxy
+  settings) and keeps the `https`-only precondition.
+- **Fixed: Instagram carousels failed with "No video formats found!".** A
+  multi-item post (several photos and/or videos) was aborted as a whole the
+  moment yt-dlp hit a photo-only item, which has no video or audio format to
+  select. Carousels are now handled item by item: each video is saved as
+  `@username_postid_N.mp4`, a photo item is skipped with a note (or, with
+  `--photos`, saved as-is into the `@username_postid/` folder), and one bad
+  item no longer loses the rest of the post. Re-running a carousel skips items
+  already saved.
+- **Fixed: `--mp3` on TikTok could fail with ffmpeg exit code 234
+  ("Output ... same as Input").** When TikTok serves a post's audio stream
+  already in `.mp3` format, the downloaded file and the intended MP3 output
+  were the exact same path, so ffmpeg was asked to read and write one file at
+  once — which truncates it mid-read and fails outright. `extract_clean_mp3`
+  now detects that collision, re-encodes into a sibling temp file, and swaps
+  it into place, so this works regardless of what format the source happens
+  to already be in.
+
 ## [0.6.0]
 
 Cookies, captions, full channel downloads, and per-photo saving for carousel posts —

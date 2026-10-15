@@ -3,6 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Platforms](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey)
+[![Support](https://img.shields.io/badge/Support-DONATE.md-FF5E5B?style=flat)](DONATE.md)
 
 A command-line downloader for **TikTok, YouTube, Dailymotion, SoundCloud, Instagram,
 X, and Threads** — security-hardened, with automatic quality-aware deduplication and
@@ -170,7 +171,20 @@ definitionally the best available quality — into a new folder named after the 
 an already-downloaded post is skipped rather than re-downloading into a duplicate
 folder. `--photos` only applies to TikTok/Instagram/X/Threads; on any other platform,
 or if the post turns out to be a regular video rather than a photo post, Grabinator
-notes that and downloads normally instead. It can't be combined with `--mp3`,
+notes that and downloads normally instead.
+
+Instagram photos can't be downloaded as media by yt-dlp itself, so with `--photos`
+Grabinator requests every size Instagram lists for each photo and keeps the one
+with the most pixels, then prints its resolution (for example
+`Saved 10 photo(s) (1080x1350)`). The photo is saved exactly as Instagram serves
+it, so it can be no larger than the largest size Instagram lists for the post;
+passing your login with `--cookies-from-browser` can expose larger versions than a
+logged-out request. Keep yt-dlp current (`pip install -U yt-dlp`) for this.
+
+Multi-item posts (an Instagram carousel, for example) are handled item by item:
+every video is saved as `@username_postid_N.mp4`, and photo items are skipped with
+a note unless `--photos` is passed, in which case they're saved into the post's
+folder. It can't be combined with `--mp3`,
 `--captions`, `-q`/`--choose-quality`, or `-c`/`--check-size`.
 
 ### Quality selection
@@ -306,6 +320,9 @@ project's history.
 ## Author
 
 EagleSquwak — September 2026
+
+If Grabinator has been useful to you, see [DONATE.md](DONATE.md) for ways to
+support its development.
 
 ## License
 
